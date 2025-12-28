@@ -10,8 +10,9 @@ Why? Real-time blind spot detection for Vulnerable Road Users (VRU) designed for
 ## Features
 * **Auto-Start:** Runs automatically 10 seconds after boot (Headless Mode).
 * **Private Network:** Creates `TALOS_LINK` hotspot for off-grid connection.
-* **High-Speed AI:** Uses fine-tuned version of YOLOv8 (NCNN optimized) for ~10 FPS detection on Pi 5.
+* **High-Speed AI:** Uses fine-tuned version of YOLOv8 (NCNN optimized) achieving ~6ms inference latency on Pi 5.
 * **Hardware:** Raspberry Pi 5 + IMX296 Global Shutter Camera.
+* **Collision Warning Logic:** Real-time Time-To-Collision (TTC) estimation triggers visual alerts when vehicles approach < 4 seconds.
 
 ## Installation
 1.  Clone the repository:
