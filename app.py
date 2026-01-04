@@ -1,4 +1,4 @@
-
+import math
 import cv2
 import numpy as np
 import threading
@@ -19,10 +19,73 @@ latest_frame = None
 
 # A 'Lock' is a safety mechanism. It ensures that the AI thread doesn't write 
 # to 'latest_frame' at the exact same moment the Flask thread tries to read it.
-# This prevents corrupted images or crashes ("Race Conditions").
+# This prevents corrupted images or crashes (Race Conditions).
 lock = threading.Lock()
 
 app = Flask(__name__)
+
+class LoomingTracker:
+    def __init__(self, time_threshold=4.0):
+        # Stores {id: (cx, cy, width, timestamp)}
+        self.history = {}
+        self.next_id = 0
+        self.time_threshold = time_threshold # Alert if impact < 4.0 seconds
+
+    def update(self, boxes):
+        """
+        Input: boxes [[x, y, w, h], ...]
+        Returns: List of danger warnings ["Impact in 1.2s!", ...]
+        """
+        current_time = time.time()
+        current_objs = {}
+        alerts = []
+
+        for x, y, w, h in boxes:
+            cx, cy = x + w/2, y + h/2
+            
+            # 1. Greedy Matching (Find closest object from last frame)
+            # We look for the closest center point within 100 pixels
+            # Unfortunately... O(n^2) time complexity
+            best_match = None
+            min_dist = 100.0
+
+            for obj_id, (old_cx, old_cy, old_w, old_t) in self.history.items():
+                dist = math.hypot(cx - old_cx, cy - old_cy)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_match = (obj_id, old_w, old_t)
+
+            if best_match:
+                obj_id, old_w, old_t = best_match
+                
+                # 2. THE PHYSICS (Time-To-Collision)
+                # dt is the time elapsed since the last frame
+                dt = current_time - old_t
+                if dt > 0:
+                    # Expansion Rate (Pixels/Second)
+                    expansion_rate = (w - old_w) / dt
+                    
+                    # Only calculate if object is actually growing (approaching)
+                    # Prevents a 1-pixel jitter from triggering the alarm
+                    if expansion_rate > 10:
+                        ttc = w / expansion_rate
+                        
+                        # Trigger if impact is imminent
+                        if 0 < ttc < self.time_threshold:
+                            alerts.append(f"IMPACT {ttc:.1f}s")
+            else:
+                # New object found
+                obj_id = self.next_id
+                self.next_id += 1
+            
+            # Update state
+            current_objs[obj_id] = (cx, cy, w, current_time)
+        
+        self.history = current_objs
+        return alerts
+
+# initialize global tracker
+tracker = LoomingTracker()
 
 # --- 1. UTILITIES ---
 # (Same logic as the synchronous version, just condensed for brevity)
@@ -131,11 +194,34 @@ def post_process_and_draw(raw_results, scale, pads, orig_dims, frame):
     indices = cv2.dnn.NMSBoxes(
         bboxes=[[int(xx), int(yy), int(ww), int(hh)] for xx, yy, ww, hh in zip(x1, y1, x2-x1, y2-y1)],
         scores=scores.tolist(),
-        score_threshold=0.25, # Use your CONF_THRESHOLD
+        score_threshold=0.3, # Use your CONF_THRESHOLD
         nms_threshold=0.45
     )
 
-    # 6. Draw boxes
+    # 6. LOOMING DETECTION LOGIC!
+    # a. Prepare clean list of boxes [x, y, w, h] for the tracker
+    tracker_boxes = []
+    if len(indices) > 0:
+        for i in indices:
+            inx = i if isinstance(i, (int, np.integer)) else i[0]
+            # Convert centered coordinates to the top left for the tracking math
+            # We need [x, y, w, h] in absolute pixels
+            bw = int(x2[idx] - x1[idx])
+            bh = int(y2[idx] - y1[idx])
+            bx = int(x1[idx])
+            by = int(y1[idx])
+            tracker_boxes.append([bx, by, bw, bh])
+
+    # b. Update tracker and get warnings
+    # Note: uses the 'tracker' global instance defined higher up
+    alerts = tracker.update(tracker_boxes)
+
+    # c. Draw "IMPACT" warning if necessary
+    if alerts:
+        # Big Red Text at the top center
+        cv2.putText(frame, alerts[0], (50,100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+
+    # 7. Draw boxes
     for i in indices:
         idx = i if isinstance(i, (int, np.integer)) else i[0]
         
