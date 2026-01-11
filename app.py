@@ -286,7 +286,7 @@ def ai_worker():
     print("AI Thread: Starting Loop...")
     
     try:
-        # --- NEW: EXPLICITLY ACTIVATE THE NETWORK GROUP FIRST ---
+        # --- EXPLICITLY ACTIVATE THE NETWORK GROUP FIRST ---
         with network_group.activate(): 
             # NOW open the streams inside the active group
             with InferVStreams(network_group, input_params, output_params) as infer_pipeline:
@@ -311,7 +311,6 @@ def ai_worker():
                         
     except Exception as e:
         print(f"\nCRITICAL HAILO ERROR: {e}")
-        # If this persists, the HEF might be compiled for the wrong chip (Hailo-8 vs Hailo-8L)
 
 # --- 3. FLASK SERVER ---
 @app.route('/')
