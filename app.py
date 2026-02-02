@@ -36,7 +36,7 @@ class LoomingTracker:
         Input: boxes [[x, y, w, h], ...]
         Returns: List of danger warnings ["Impact in 1.2s!", ...]
         """
-        current_time = time.time()
+        current_time = time.monotonic()
         current_objs = {}
         alerts = []
 
@@ -61,25 +61,32 @@ class LoomingTracker:
                 # 2. THE PHYSICS (Time-To-Collision)
                 # dt is the time elapsed since the last frame
                 dt = current_time - old_t
-                if dt > 0:
+                if dt > 0.25:
                     # Expansion Rate (Pixels/Second)
                     expansion_rate = (w - old_w) / dt
                     
                     # Only calculate if object is actually growing (approaching)
                     # Prevents a 1-pixel jitter from triggering the alarm
-                    if expansion_rate > 10:
+                    if expansion_rate > 30:
                         ttc = w / expansion_rate
                         
                         # Trigger if impact is imminent
                         if 0 < ttc < self.time_threshold:
                             alerts.append(f"IMPACT {ttc:.1f}s")
+                    
+                    # Update baseline to NOW
+                    current_objs[obj_id] = (cx, cy, w, current_time)
+
+                else:
+                    # Too soon, keep the old baseline to accumulate changes
+                    current_objs[obj_id] = (cx, cy, old_w, old_t)
             else:
                 # New object found
                 obj_id = self.next_id
                 self.next_id += 1
             
-            # Update state
-            current_objs[obj_id] = (cx, cy, w, current_time)
+                # Update state
+                current_objs[obj_id] = (cx, cy, w, current_time)
         
         self.history = current_objs
         return alerts
@@ -88,9 +95,8 @@ class LoomingTracker:
 tracker = LoomingTracker()
 
 # --- 1. UTILITIES ---
-# (Same logic as the synchronous version, just condensed for brevity)
 def preprocess_image(image, target_size=640):
-    """Resize with letterboxing (adding gray padding)."""
+    # Resize with letterboxing (adding gray padding).
     h, w = image.shape[:2]
     scale = min(target_size / w, target_size / h)
     nw, nh = int(w * scale), int(h * scale)
@@ -111,7 +117,7 @@ def post_process_and_draw(raw_results, scale, pads, orig_dims, frame):
     # The logs showed this is a list of length 1: [[Class0, Class1, Class2...]]
     batch = list(raw_results.values())[0]
 
-    # --- THE FIX: UNWRAP THE BATCH LIST ---
+    # --- UNWRAP THE BATCH LIST ---
     # We want the inner list of 5 items, not the outer list of 1 item.
     if isinstance(batch, list) and len(batch) == 1 and isinstance(batch[0], list):
         detections_by_class = batch[0]
@@ -123,7 +129,7 @@ def post_process_and_draw(raw_results, scale, pads, orig_dims, frame):
     scores_list = []
     class_ids_list = []
 
-    # 2. Iterate through each class (Now correctly loops 5 times)
+    # 2. Iterate through each class
     for class_id, detections in enumerate(detections_by_class):
         
         # Safety: If detections is None or empty
@@ -194,7 +200,7 @@ def post_process_and_draw(raw_results, scale, pads, orig_dims, frame):
     indices = cv2.dnn.NMSBoxes(
         bboxes=[[int(xx), int(yy), int(ww), int(hh)] for xx, yy, ww, hh in zip(x1, y1, x2-x1, y2-y1)],
         scores=scores.tolist(),
-        score_threshold=0.3, # Use your CONF_THRESHOLD
+        score_threshold=0.3, # Use CONF_THRESHOLD
         nms_threshold=0.45
     )
 
@@ -203,7 +209,7 @@ def post_process_and_draw(raw_results, scale, pads, orig_dims, frame):
     tracker_boxes = []
     if len(indices) > 0:
         for i in indices:
-            inx = i if isinstance(i, (int, np.integer)) else i[0]
+            idx = i if isinstance(i, (int, np.integer)) else i[0]
             # Convert centered coordinates to the top left for the tracking math
             # We need [x, y, w, h] in absolute pixels
             bw = int(x2[idx] - x1[idx])
@@ -268,11 +274,13 @@ def ai_worker():
     # 2. Then use 'videoscale' to shrink it down to 640x480 for the AI.
     gst_pipeline = (
         "libcamerasrc ! "
-        "video/x-raw, format=NV12, width=1456, height=1088 ! "  # <--- FORCE FULL SENSOR
+        "video/x-raw, format=NV12, width=1456, height=1088 ! " # Full Sensor
         "videoscale ! "
-        "video/x-raw, width=640, height=480 ! "                # <--- NOW RESIZE
-        "videoflip method=rotate-180 ! "
+        "video/x-raw, width=640, height=480 ! "               # Downscale to 4:3
+        "videoflip method=rotate-180 ! "                       # Flip because camera is mounted upside down
         "videoconvert ! "
+        "videobox top=-80 bottom=-80 ! "                      # Adds 80px black borders to top/bottom
+        "videoconvert ! "                                      # ensuring output is 640x640
         "video/x-raw, format=BGR ! "
         "appsink drop=1"
     )
@@ -282,9 +290,7 @@ def ai_worker():
     if not cap.isOpened():
         print("AI Thread: CRITICAL ERROR - Camera failed to open.")
         return
-
-    print("AI Thread: Starting Loop...")
-    
+ 
     try:
         # --- NEW: EXPLICITLY ACTIVATE THE NETWORK GROUP FIRST ---
         with network_group.activate(): 
@@ -297,8 +303,13 @@ def ai_worker():
                         time.sleep(1)
                         continue
 
-                    processed, scale, pads = preprocess_image(frame, target_size=640)
+                    #processed, scale, pads = preprocess_image(frame, target_size=640)
                     
+                    # new preprocessing implementation
+                    processed = frame
+                    scale = 1.0
+                    pads = (0, 0)
+
                     input_data = {input_info.name: np.expand_dims(processed, axis=0)}
                     
                     # This line should now succeed
@@ -328,6 +339,8 @@ def video_feed():
             # Check for new frame
             with lock:
                 if latest_frame is None:
+                    # If the frame isn't ready, pause and try again
+                    time.sleep(0.1)
                     continue # Wait until AI thread produces the first frame
                 
                 # Make a local reference so we can release the lock fast
