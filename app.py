@@ -26,69 +26,81 @@ app = Flask(__name__)
 
 class LoomingTracker:
     def __init__(self, time_threshold=4.0):
-        # Stores {id: (cx, cy, width, timestamp)}
+        # History stores: {id: {'cx': float, 'cy': float, 'w': float, 't': float, 'hits': int}}
         self.history = {}
         self.next_id = 0
-        self.time_threshold = time_threshold # Alert if impact < 4.0 seconds
+        self.time_threshold = time_threshold
+        self.alpha = 0.7  # Smoothing factor (Lower = smoother but more lag)
 
     def update(self, boxes):
-        """
-        Input: boxes [[x, y, w, h], ...]
-        Returns: List of danger warnings ["Impact in 1.2s!", ...]
-        """
-        current_time = time.monotonic()
-        current_objs = {}
+        current_time = time.monotonic() # Use monotonic!
         alerts = []
+        
+        # Temp dict for the next frame state
+        next_history = {}
+        used_ids = set()
 
+        # 1. Match new boxes to old history
         for x, y, w, h in boxes:
             cx, cy = x + w/2, y + h/2
             
-            # 1. Greedy Matching (Find closest object from last frame)
-            # We look for the closest center point within 100 pixels
-            # Unfortunately... O(n^2) time complexity
-            best_match = None
-            min_dist = 100.0
+            best_id = None
+            min_dist = 100.0 # Pixel match threshold
 
-            for obj_id, (old_cx, old_cy, old_w, old_t) in self.history.items():
-                dist = math.hypot(cx - old_cx, cy - old_cy)
+            for obj_id, data in self.history.items():
+                if obj_id in used_ids: continue
+                
+                dist = math.hypot(cx - data['cx'], cy - data['cy'])
                 if dist < min_dist:
                     min_dist = dist
-                    best_match = (obj_id, old_w, old_t)
+                    best_id = obj_id
 
-            if best_match:
-                obj_id, old_w, old_t = best_match
+            if best_id is not None:
+                # MATCH FOUND: Smooth and Update
+                prev = self.history[best_id]
                 
-                # 2. THE PHYSICS (Time-To-Collision)
-                # dt is the time elapsed since the last frame
-                dt = current_time - old_t
-                if dt > 0.25:
-                    # Expansion Rate (Pixels/Second)
-                    expansion_rate = (w - old_w) / dt
+                # Smooth the width (EMA) to stop jitter
+                smoothed_w = (self.alpha * w) + ((1 - self.alpha) * prev['w'])
+                
+                dt = current_time - prev['t']
+                
+                # PHYSICS CHECK
+                if dt > 0:
+                    expansion_rate = (smoothed_w - prev['w']) / dt
                     
-                    # Only calculate if object is actually growing (approaching)
-                    # Prevents a 1-pixel jitter from triggering the alarm
-                    if expansion_rate > 30:
-                        ttc = w / expansion_rate
+                    # Require meaningful expansion (>5px/sec) to ignore noise
+                    if expansion_rate > 5:
+                        ttc = smoothed_w / expansion_rate
                         
-                        # Trigger if impact is imminent
                         if 0 < ttc < self.time_threshold:
-                            alerts.append(f"IMPACT {ttc:.1f}s")
-                    
-                    # Update baseline to NOW
-                    current_objs[obj_id] = (cx, cy, w, current_time)
-
+                            # "Strike System": Only alert if we see danger 3 frames in a row
+                            hits = prev.get('hits', 0) + 1
+                            if hits >= 3:
+                                alerts.append(f"IMPACT {ttc:.1f}s")
+                        else:
+                            hits = max(0, prev.get('hits', 0) - 1)
+                    else:
+                         hits = max(0, prev.get('hits', 0) - 1)
                 else:
-                    # Too soon, keep the old baseline to accumulate changes
-                    current_objs[obj_id] = (cx, cy, old_w, old_t)
+                    hits = prev.get('hits', 0)
+
+                # Update State
+                next_history[best_id] = {
+                    'cx': cx, 'cy': cy, 'w': smoothed_w, 
+                    't': current_time, 'hits': hits
+                }
+                used_ids.add(best_id)
+                
             else:
-                # New object found
-                obj_id = self.next_id
+                # NEW OBJECT
+                next_history[self.next_id] = {
+                    'cx': cx, 'cy': cy, 'w': w, 
+                    't': current_time, 'hits': 0
+                }
                 self.next_id += 1
-            
-                # Update state
-                current_objs[obj_id] = (cx, cy, w, current_time)
-        
-        self.history = current_objs
+
+        # 2. Persistence (Optional: Keep lost objects for 1 frame? For now, we clear them)
+        self.history = next_history
         return alerts
 
 # initialize global tracker
@@ -252,76 +264,74 @@ def post_process_and_draw(raw_results, scale, pads, orig_dims, frame):
 # Its ONLY job is to update 'latest_frame' as fast as possible.
 def ai_worker():
     global latest_frame
-    print("AI Thread: Initializing Hailo...")
     
-    # Init Hailo
-    try:
-        target = VDevice()
-        hef = HEF(HEF_PATH)
-        configure_params = ConfigureParams.create_from_hef(hef=hef, interface=HailoStreamInterface.PCIe)
-        network_groups = target.configure(hef, configure_params)
-        network_group = network_groups[0]
+    # OUTER LOOP: The "Watchdog" that restarts the whole system on crash
+    while True:
+        print("AI Thread: (Re)Starting Hailo Pipeline...")
+        cap = None
+        network_group = None
         
-        input_params = InputVStreamParams.make(network_group, format_type=FormatType.UINT8)
-        output_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
-        input_info = hef.get_input_vstream_infos()[0]
-    except Exception as e:
-        print(f"AI Thread: Failed to init Hailo. Error: {e}")
-        return
+        try:
+            # --- HARDWARE INIT (Same as before) ---
+            target = VDevice()
+            hef = HEF(HEF_PATH)
+            configure_params = ConfigureParams.create_from_hef(hef=hef, interface=HailoStreamInterface.PCIe)
+            network_groups = target.configure(hef, configure_params)
+            network_group = network_groups[0]
+            
+            input_params = InputVStreamParams.make(network_group, format_type=FormatType.UINT8)
+            output_params = OutputVStreamParams.make(network_group, format_type=FormatType.FLOAT32)
+            input_info = hef.get_input_vstream_infos()[0]
 
-    # FIXED PIPELINE:
-    # 1. Ask for FULL resolution first (1456x1088 for IMX296) to get the wide angle.
-    # 2. Then use 'videoscale' to shrink it down to 640x480 for the AI.
-    gst_pipeline = (
-        "libcamerasrc ! "
-        "video/x-raw, format=NV12, width=1456, height=1088 ! " # Full Sensor
-        "videoscale ! "
-        "video/x-raw, width=640, height=480 ! "               # Downscale to 4:3
-        "videoflip method=rotate-180 ! "                       # Flip because camera is mounted upside down
-        "videoconvert ! "
-        "videobox top=-80 bottom=-80 ! "                      # Adds 80px black borders to top/bottom
-        "videoconvert ! "                                      # ensuring output is 640x640
-        "video/x-raw, format=BGR ! "
-        "appsink drop=1"
-    )
+            # FIXED PIPELINE:
+            # 1. Ask for FULL resolution first (1456x1088 for IMX296) to get the wide angle.
+            # 2. Then use 'videoscale' to shrink it down to 640x480 for the AI.
+            gst_pipeline = (
+                "libcamerasrc ! "
+                "video/x-raw, format=NV12, width=1456, height=1088 ! " # Full Sensor
+                "videoscale ! "
+                "video/x-raw, width=640, height=480 ! "               # Downscale to 4:3
+                "videoflip method=rotate-180 ! "                       # Flip because camera is mounted upside down
+                "videoconvert ! "
+                "videobox top=-80 bottom=-80 ! "                      # Adds 80px black borders to top/bottom
+                "videoconvert ! "                                      # ensuring output is 640x640
+                "video/x-raw, format=BGR ! "
+                "appsink drop=1"
+            )
+            cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
 
-    cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
-    
-    if not cap.isOpened():
-        print("AI Thread: CRITICAL ERROR - Camera failed to open.")
-        return
- 
-    try:
-        # --- EXPLICITLY ACTIVATE THE NETWORK GROUP FIRST ---
-        with network_group.activate(): 
-            # NOW open the streams inside the active group
-            with InferVStreams(network_group, input_params, output_params) as infer_pipeline:
-                while True:
-                    ret, frame = cap.read()
-                    if not ret:
-                        print("AI Thread: Camera read failed.")
-                        time.sleep(1)
-                        continue
+            if not cap.isOpened():
+                raise RuntimeError("Failed to open GStreamer pipeline")
 
-                    #processed, scale, pads = preprocess_image(frame, target_size=640)
-                    
-                    # new preprocessing implementation
-                    processed = frame
-                    scale = 1.0
-                    pads = (0, 0)
+            # --- INFERENCE LOOP ---
+            with network_group.activate(): 
+                with InferVStreams(network_group, input_params, output_params) as infer_pipeline:
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
+                            print("AI Thread: Camera frozen. Restarting...")
+                            break # Break inner loop -> Trigger Outer Loop Restart
 
-                    input_data = {input_info.name: np.expand_dims(processed, axis=0)}
-                    
-                    # This line should now succeed
-                    raw_results = infer_pipeline.infer(input_data)
-                    
-                    final_frame = post_process_and_draw(raw_results, scale, pads, frame.shape[:2], frame)
-                    
-                    with lock:
-                        latest_frame = final_frame.copy()
+                        # Preprocessing is now handled by GStreamer (Zero Copy!)
+                        # Just wrap it for Hailo
+                        input_data = {input_info.name: np.expand_dims(frame, axis=0)}
                         
-    except Exception as e:
-        print(f"\nCRITICAL HAILO ERROR: {e}")
+                        raw_results = infer_pipeline.infer(input_data)
+                        
+                        # Post-process using the frame directly
+                        final_frame = post_process_and_draw(raw_results, 1.0, (0,0), frame.shape[:2], frame)
+                        
+                        with lock:
+                            latest_frame = final_frame # No copy needed if we swap ref
+                            
+        except Exception as e:
+            print(f"CRITICAL ERROR: {e}")
+            print("Restarting AI subsystem in 2 seconds...")
+            time.sleep(2) # Let the hardware cool/reset
+            
+        finally:
+            # CLEANUP: Ensure we release resources before restarting
+            if cap: cap.release()
 
 # --- 3. FLASK SERVER ---
 @app.route('/')
